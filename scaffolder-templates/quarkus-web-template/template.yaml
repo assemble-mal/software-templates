@@ -3,7 +3,7 @@ kind: Template
 metadata:
   name: quarkus-web-template
   title: Quarkus Service
-  description: Create a simple microservice using Quarkus Java
+  description: Create a simple microservice using Quarkus
   tags:
     - recommended
     - java
@@ -14,28 +14,31 @@ spec:
   type: service
 
   parameters:
-    - title: Provide some simple information
+    - title: Provide Information for Application
       required:
         - component_id
         - owner
-        - organization
         - java_package_name
       properties:
         component_id:
           title: Name
           type: string
           description: Unique name of the component
+          default: my-quarkus-app
           ui:field: EntityNamePicker
         group_id:
           title: Group Id
           type: string
+          default: redhat.assemble
           description: Maven Group Id
         artifact_id:
           title: Artifact Id
           type: string
+          default: quarkus-app
           description: Maven Artifact Id
         java_package_name:
           title: Java Package Name
+          default: org.redhat.assemble
           type: string
           description: Name for the java package. eg (com.redhat.blah)
         description:
@@ -45,20 +48,33 @@ spec:
         owner:
           title: Owner
           type: string
-          description: Owner of the component
+          description: IdP owner of the component
           ui:field: OwnerPicker
           ui:options:
             allowedKinds:
               - Group
-        organization:
-          title: Organization
+    - title: Provide Build Information
+      properties:
+        image_host:
+          title: Image Host
           type: string
-          description: Organization of this application
-          ui:field: OrganizationPicker
-          ui:options:
-            allowedKinds:
-              - Group
-    - title: Choose a location
+          description: Host for storing image (defaults to openshift internal)
+          default: image-registry.openshift-image-registry.svc:5000
+        image_name:
+          title: Image Name
+          type: string
+          default: my-quarkus-app-dev/my-quarkus-app
+          description: Build Image Name <NAMESPACE><COMPONENT_ID> to use internal registry
+        image_tag:
+          title: Image Tag
+          default: latest
+          type: string
+          description: Build Image tag
+        gitops:
+          title: Include GitOps
+          type: boolean
+          description: Should the component include a GitOps workflow
+    - title: Application repository Information
       required:
         - repoUrl
       properties:
@@ -76,7 +92,7 @@ spec:
       action: fetch:template
       input:
         url: ./skeleton
-        copyWithoutRender:
+        copyWithoutTemplating:
           - .github/workflows/*
         values:
           component_id: ${{ parameters.component_id }}
@@ -85,51 +101,69 @@ spec:
           artifact_id: ${{ parameters.artifact_id }}
           java_package_name: ${{ parameters.java_package_name }}
           owner: ${{ parameters.owner }}
-          organization: ${{ parameters.organization }}
-          destination: ${{ parameters.repoUrl | parseRepoUrl }}
-          http_port: 8080
+          destination: ${{ (parameters.repoUrl | parseRepoUrl).owner }}/${{ (parameters.repoUrl | parseRepoUrl).repo }}
+          port: 8080
 
     - id: publish
       name: Publishing to Source Code Repository
       action: publish:github
       input:
-        allowedHosts: ["github.com"]
         description: This is ${{ parameters.component_id }}
         repoUrl: ${{ parameters.repoUrl }}
+        defaultBranch: main
+        protectDefaultBranch: false
+        repoVisibility: public
 
     - id: register
       name: Registering to the Catalog
       action: catalog:register
       input:
         repoContentsUrl: ${{ steps.publish.output.repoContentsUrl }}
-        catalogInfoPath: "/catalog-info.yaml"
- 
-    - id: template-tenant-gitops 
-      name: tenant Argcd Fetch Skeleton + Template
+        catalogInfoPath: '/catalog-info.yaml'
+
+    - id: template-gitops-deployment
+      if: ${{ parameters.gitops }}
+      name: Generating Deployment Resources
       action: fetch:template
       input:
-        url: ./app-gitops
-        copyWithoutRender: []
+        url: ./manifests
+        copyWithoutTemplating: []
         values:
           component_id: ${{ parameters.component_id }}
           description: ${{ parameters.description }}
-          artifact_id: ${{ parameters.component_id }}
-          java_package_name: ${{ parameters.java_package_name }}
-          owner: ${{ parameters.owner }}
-          destination: ${{ parameters.repoUrl | parseRepoUrl }}
-          http_port: 8080
-          organization: ${{ parameters.organization }}
-        targetPath: ./tenant-gitops          
+          destination: https://github.com/${{ (parameters.repoUrl | parseRepoUrl).owner }}/${{ (parameters.repoUrl | parseRepoUrl).repo }}-gitops
+          source_repository: https://github.com/${{ (parameters.repoUrl | parseRepoUrl).owner }}/${{ (parameters.repoUrl | parseRepoUrl).repo }}
+          repository_name: ${{ (parameters.repoUrl | parseRepoUrl).repo }}
+          git_owner: ${{ (parameters.repoUrl | parseRepoUrl).owner }}
+          cluster: baseurl.cluster-example.com
+          namespace: ${{ parameters.component_id }}-dev
+          image_host: ${{ parameters.image_host }}
+          image_name: ${{ parameters.image_name }}
+          image_tag: ${{ parameters.image_tag }}
+          port: 8080
+        targetPath: ./tenant-gitops
 
-    - id: pull-request
-      name: make a pr with the new argocd
-      action: publish:github:pull-request
+    - id: publish-gitops
+      if: ${{ parameters.gitops }}
+      name: Publishing to Resource Repository
+      action: publish:github
       input:
-        repoUrl: github.com?repo=${{ parameters.organization.split(":")[1] }}-gitops&owner=${{ parameters.organization }}
-        branchName: ${{ parameters.component_id }}
-        title: argocd apps for ${{ parameters.component_id }}
-        description: argocd apps ${{ parameters.component_id }}
+        repoUrl: github.com?repo=${{ (parameters.repoUrl | parseRepoUrl).repo }}-gitops&owner=${{ (parameters.repoUrl | parseRepoUrl).owner }}
+        title: gitops resources for ${{ parameters.component_id }}
+        description: gitops resources for ${{ parameters.component_id }}
         sourcePath: ./tenant-gitops
+
+    - id: create-argocd-resources
+      if: ${{ parameters.gitops }}
+      name: Create ArgoCD Resources
+      action: argocd:create-resources
+      input:
+        appName: ${{ parameters.component_id }}-bootstrap
+        argoInstance: main
+        namespace: assemble-argocd
+        repoUrl: https://github.com/${{ (parameters.repoUrl | parseRepoUrl).owner }}/${{ (parameters.repoUrl | parseRepoUrl).repo }}-gitops.git
+        path: 'argocd/'
+
   output:
     links:
       - title: Source Code Repository
